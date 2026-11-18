@@ -6,6 +6,23 @@ workflows:
     environment:
       xcode: latest
     scripts:
+      - name: Organizar os arquivos
+        script: |
+          set -e
+          mkdir -p Sources Support Resources/Assets.xcassets/AppIcon.appiconset
+          for f in *.swift; do [ -f "$f" ] && mv "$f" Sources/; done
+          if [ -f Info.plist ]; then mv Info.plist Support/; fi
+          if [ -f icon-1024.png ]; then mv icon-1024.png Resources/Assets.xcassets/AppIcon.appiconset/; fi
+          echo '{ "info" : { "author" : "xcode", "version" : 1 } }' > Resources/Assets.xcassets/Contents.json
+          if [ -f Resources/Assets.xcassets/AppIcon.appiconset/icon-1024.png ]; then
+            echo '{ "images" : [ { "filename" : "icon-1024.png", "idiom" : "universal", "platform" : "ios", "size" : "1024x1024" } ], "info" : { "author" : "xcode", "version" : 1 } }' > Resources/Assets.xcassets/AppIcon.appiconset/Contents.json
+          else
+            echo '{ "images" : [ { "idiom" : "universal", "platform" : "ios", "size" : "1024x1024" } ], "info" : { "author" : "xcode", "version" : 1 } }' > Resources/Assets.xcassets/AppIcon.appiconset/Contents.json
+          fi
+          echo "Arquivos encontrados:"
+          ls -R Sources Support Resources
+          if ! ls Sources/*.swift >/dev/null 2>&1; then echo "Faltam os arquivos .swift no repositório"; exit 1; fi
+          if [ ! -f Support/Info.plist ]; then echo "Falta o arquivo Info.plist no repositório"; exit 1; fi
       - name: Instalar o XcodeGen
         script: brew install xcodegen
       - name: Gerar o projeto

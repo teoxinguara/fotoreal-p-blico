@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>pt-BR</string>
+	<key>CFBundleDisplayName</key><string>FOTO REAL</string>
+	<key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key><true/>
+	<key>UILaunchScreen</key><dict/>
+	<key>UIStatusBarStyle</key><string>UIStatusBarStyleLightContent</string>
+	<key>UIViewControllerBasedStatusBarAppearance</key><true/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+	<key>NSCameraUsageDescription</key><string>O FOTO REAL usa a câmera ligada no cabo para receber as suas fotos.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key><string>O FOTO REAL salva as fotos aprovadas no app Fotos.</string>
+	<key>NSPhotoLibraryUsageDescription</key><string>O FOTO REAL abre as fotos da sua galeria para a curadoria.</string>
+	<key>NSLocalNetworkUsageDescription</key><string>O FOTO REAL recebe fotos da câmera pela rede Wi‑Fi.</string>
+</dict>
+</plist>
