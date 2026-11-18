@@ -15,7 +15,7 @@ targets:
       base:
         PRODUCT_NAME: FotoReal
         PRODUCT_BUNDLE_IDENTIFIER: com.fotoreal.app
-        MARKETING_VERSION: "0.1"
+        MARKETING_VERSION: "1.6"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"

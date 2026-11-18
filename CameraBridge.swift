@@ -39,7 +39,16 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     private var polling = false
     private var pollTimer: Timer?
     private var txid: UInt32 = 1
-    private var canonQueue: [(UInt32, String)] = []
+    private var canonQueue: [(UInt32, String, Int)] = []
+    private var knownHandles = Set<UInt32>()
+    private var candidates = Set<UInt32>()
+    private var baselineMissing = true
+    private var sawNewObject = false
+    private var pollCount = 0
+    private var eventCount = 0
+    private var found = 0
+    private var gotCount = 0
+    private var diag = ""
     private var canonDone = Set<UInt32>()
     private var isCanon: Bool { (camera?.name ?? "").lowercased().contains("canon") }
 
@@ -266,7 +275,11 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
                                 "sync": syncMode,
                                 "every": Int(every),
                                 "open": sessionOpen,
-                                "canon": canonMode]
+                                "canon": canonMode,
+                                "diag": diag,
+                                "events": eventCount,
+                                "found": found,
+                                "got": gotCount]
         if let cam = camera {
             o["name"] = cam.name ?? "Câmera"
             if let b = baseline { o["items"] = max(b.count, cam.mediaFiles?.count ?? 0) }
@@ -293,6 +306,9 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         canonTried = false
         polling = false
         canonQueue.removeAll()
+        knownHandles.removeAll()
+        candidates.removeAll()
+        baselineMissing = true
         camera = nil
         sessionOpen = false
         catalogReady = false
@@ -375,13 +391,34 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
                 self.canonTried = true
                 self.canonMode = ok1 || ok2
                 if self.canonMode {
+                    // Guarda o que já está no cartão para trazer só as fotos novas.
+                    self.listHandles { handles in
+                        self.knownHandles = Set(handles)
+                        if !handles.isEmpty { self.baselineMissing = false }
+                        self.diag = "Cartão lido: \(handles.count) arquivos"
+                        self.pushStatus()
+                    }
                     self.pollTimer?.invalidate()
                     self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.poll() }
                 } else {
+                    self.diag = "A câmera não aceitou o modo remoto"
                     self.maybeClose()
                 }
                 self.pushStatus()
             }
+        }
+    }
+
+    /// Lista todos os arquivos do cartão (GetObjectHandles).
+    private func listHandles(_ done: @escaping ([UInt32]) -> Void) {
+        ptp(0x1007, [0xFFFFFFFF, 0, 0]) { [weak self] data, ok in
+            guard let self = self, ok, let d = data else { done([]); return }
+            let b = [UInt8](d)
+            let n = Int(self.rd32(b, 0))
+            var out: [UInt32] = []
+            var i = 0
+            while i < n && 4 + i * 4 + 3 < b.count { out.append(self.rd32(b, 4 + i * 4)); i += 1 }
+            done(out)
         }
     }
 
@@ -390,8 +427,16 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         polling = true
         ptp(0x9116) { [weak self] data, _ in                 // GetEvent
             guard let self = self else { return }
-            self.polling = false
             if let d = data { self.parseEvents([UInt8](d)) }
+            self.pollCount += 1
+            // A cada 3 segundos confere o cartão, mesmo sem aviso da câmera.
+            if self.pollCount % 3 == 0 || self.sawNewObject {
+                self.sawNewObject = false
+                self.scanNew { self.polling = false; self.canonNext() }
+            } else {
+                self.polling = false
+                self.canonNext()
+            }
         }
     }
 
@@ -401,50 +446,99 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
             let size = Int(rd32(b, o)), type = rd32(b, o + 4)
             if size < 8 || o + size > b.count { break }
             if type == 0 && size == 8 { break }
-            if type == 0xC181 && size > 0x28 {                // ObjectAddedEx: foto nova
+            eventCount += 1
+            if [0xC181, 0xC1A7, 0xC186, 0xC1A9, 0xC182, 0xC1A8].contains(type) {
+                sawNewObject = true
                 let handle = rd32(b, o + 8)
-                var name = ""
-                var k = o + 0x28
-                while k < o + size && b[k] != 0 { name.append(Character(UnicodeScalar(b[k]))); k += 1 }
-                if autoImport && !name.isEmpty && wanted(name) && !canonDone.contains(handle) && !canonQueue.contains(where: { $0.0 == handle }) {
-                    canonQueue.append((handle, name))
-                }
+                if handle != 0 && !canonDone.contains(handle) && !knownHandles.contains(handle) { candidates.insert(handle) }
             }
             o += size
         }
-        canonNext()
+    }
+
+    /// Procura arquivos novos no cartão e coloca na fila.
+    private func scanNew(_ done: @escaping () -> Void) {
+        listHandles { [weak self] handles in
+            guard let self = self else { done(); return }
+            if self.knownHandles.isEmpty && !handles.isEmpty && self.baselineMissing {
+                self.knownHandles = Set(handles); self.baselineMissing = false; done(); return
+            }
+            for h in handles where !self.knownHandles.contains(h) && !self.canonDone.contains(h) { self.candidates.insert(h) }
+            self.inspect(Array(self.candidates), done)
+        }
+    }
+
+    /// Lê nome e tamanho de cada arquivo novo (GetObjectInfo).
+    private func inspect(_ list: [UInt32], _ done: @escaping () -> Void) {
+        guard let h = list.first else { done(); return }
+        let rest = Array(list.dropFirst())
+        candidates.remove(h)
+        if canonDone.contains(h) || canonQueue.contains(where: { $0.0 == h }) { inspect(rest, done); return }
+        ptp(0x1008, [h]) { [weak self] data, ok in
+            guard let self = self else { return }
+            self.knownHandles.insert(h)
+            guard ok, let d = data, d.count > 53 else { self.inspect(rest, done); return }
+            let b = [UInt8](d)
+            let format = self.rd16(b, 4)
+            let size = Int(self.rd32(b, 8))
+            let chars = Int(b[52])
+            var name = ""
+            var k = 53
+            for _ in 0..<max(0, chars - 1) {
+                let c = self.rd16(b, k); k += 2
+                if c == 0 { break }
+                if let u = UnicodeScalar(c) { name.append(Character(u)) }
+            }
+            if format != 0x3001 && !name.isEmpty && self.autoImport && self.wanted(name) {
+                self.canonQueue.append((h, name, size))
+                self.found += 1
+            } else {
+                self.canonDone.insert(h)
+            }
+            self.inspect(rest, done)
+        }
     }
 
     private func canonNext() {
-        guard !busy, !canonQueue.isEmpty else { return }
+        guard !busy, !polling, !canonQueue.isEmpty else { return }
         busy = true
-        let (handle, name) = canonQueue.removeFirst()
+        let (handle, name, size) = canonQueue.removeFirst()
         current = name
         pushStatus()
-        ptp(0x1009, [handle]) { [weak self] data, ok in      // GetObject
-            guard let self = self else { return }
-            self.canonDone.insert(handle)
-            guard ok, let d = data, d.count > 1000 else {
-                self.busy = false
-                self.current = nil
-                self.canonNext()
-                return
-            }
-            let url = self.folder.appendingPathComponent(name)
-            try? d.write(to: url)
-            Task { [weak self] in
-                await self?.send(url, name: name)
-                try? FileManager.default.removeItem(at: url)
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    self.ptp(0x9117, [handle]) { _, _ in }   // TransferComplete
-                    self.busy = false
-                    self.current = nil
-                    self.pushStatus()
-                    self.canonNext()
+        var buffer = Data()
+        let chunk: UInt32 = 2_000_000
+        func step() {
+            ptp(0x101B, [handle, UInt32(buffer.count), chunk]) { [weak self] data, ok in   // GetPartialObject
+                guard let self = self else { return }
+                if ok, let d = data, !d.isEmpty {
+                    buffer.append(d)
+                    if size > 0 && buffer.count < size && d.count > 0 { step(); return }
+                }
+                self.canonDone.insert(handle)
+                if buffer.count < 1000 || (size > 0 && buffer.count < size) {
+                    self.diag = "Falhou ao baixar \(name)"
+                    self.busy = false; self.current = nil; self.pushStatus(); self.canonNext()
+                    return
+                }
+                let url = self.folder.appendingPathComponent(name)
+                try? buffer.write(to: url)
+                Task { [weak self] in
+                    await self?.send(url, name: name)
+                    try? FileManager.default.removeItem(at: url)
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.ptp(0x9117, [handle]) { _, _ in }   // TransferComplete
+                        self.gotCount += 1
+                        self.diag = "Recebida: \(name)"
+                        self.busy = false
+                        self.current = nil
+                        self.pushStatus()
+                        self.canonNext()
+                    }
                 }
             }
         }
+        step()
     }
 
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
