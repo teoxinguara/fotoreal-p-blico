@@ -1,0 +1,48 @@
+FOTO REAL para iPhone e iPad - teste grátis (câmera no cabo USB-C)
+===================================================================
+
+ANTES DE TUDO
+  Atualize o site com o arquivo FOTO-REAL-site.zip novo (Cloudflare >
+  projeto fotoreal > Criar nova implantação). O app abre o site por dentro.
+
+1) GITHUB - guardar o código (no computador)
+  1. Descompacte FOTO-REAL-app-iOS.zip. Abra a pasta FotoRealApp.
+  2. Em github.com, crie um repositório: "+" > New repository.
+     Nome: fotoreal-app. Pode ser "Private". Create repository.
+  3. Clique em "uploading an existing file". Arraste TUDO que está dentro
+     da pasta FotoRealApp (as pastas Sources, Support, Resources e os
+     arquivos project.yml e codemagic.yaml). Clique em "Commit changes".
+
+2) CODEMAGIC - montar o app na nuvem (grátis)
+  1. Entre em codemagic.io com a sua conta do GitHub.
+  2. "Add application" > GitHub > escolha fotoreal-app.
+  3. Clique em "Start new build" e escolha o fluxo
+     "FOTO REAL - teste (sem assinatura)". Leva uns 10 minutos.
+  4. No fim, baixe o arquivo FotoReal.ipa (em "Artifacts").
+  Se der erro, abra a etapa em vermelho e mande um print para o Claude.
+
+3) SIDELOADLY - instalar no iPhone/iPad (Windows)
+  1. Instale o iTunes e o iCloud baixados do site da Apple
+     (não use as versões da Microsoft Store).
+  2. Instale o Sideloadly (sideloadly.io).
+  3. Ligue o iPhone/iPad no computador pelo cabo e toque em "Confiar".
+  4. Abra o Sideloadly, arraste o FotoReal.ipa, digite um Apple ID
+     (de preferência uma conta secundária) e clique em Start.
+  5. No iPhone/iPad:
+     - Ajustes > Geral > VPN e Gerenciamento de Dispositivo >
+       toque no seu Apple ID > Confiar.
+     - Ajustes > Privacidade e Segurança > Modo de Desenvolvedor >
+       ative e reinicie o aparelho.
+  O app vale 7 dias. Depois, repita o passo 4 (as fotos no app continuam).
+
+4) TESTAR COM A CANON R6 MARK II
+  1. Abra o FOTO REAL instalado. Se pedir o endereço do site, digite o
+     endereço do seu site no Cloudflare.
+  2. Na câmera, desligue o Wi-Fi e o Bluetooth (com eles ligados a
+     câmera não conversa pelo cabo).
+  3. No app: Início > CÂMERA > Cabo USB-C. Ligue a câmera no
+     iPhone/iPad com o cabo USB-C e ligue a câmera.
+  4. Toque em "Permitir" quando o aparelho pedir.
+  5. Deve aparecer "Canon EOS R6m2 - Conectada". Tire uma foto: ela
+     deve aparecer no app em alguns segundos.
+  6. "Importar as fotos que já estão no cartão" traz as antigas.
