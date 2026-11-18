@@ -1,22 +1,35 @@
 import Foundation
 import ImageCaptureCore
 
-/// Conversa com a câmera ligada no cabo USB‑C (Canon, Nikon, Sony...) usando o ImageCaptureCore da Apple
-/// e entrega cada foto ao FOTO REAL. Fotos tiradas com a câmera ligada chegam sozinhas.
+/// Conversa com a câmera ligada no cabo USB‑C usando o ImageCaptureCore da Apple
+/// e entrega cada foto ao FOTO REAL.
+///
+/// Câmeras Canon travam o disparo enquanto o aparelho mantém a conexão aberta.
+/// Por isso o modo padrão ("interval") abre a conexão só por alguns segundos de tempos em tempos,
+/// traz as fotos novas e fecha de novo, deixando a câmera livre para fotografar.
 final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate, ICCameraDeviceDownloadDelegate {
     /// Roda um comando JavaScript dentro do app web.
     var evaluate: ((String) async -> Void)?
 
     private let browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
-    private var catalogReady = false
-    private var autoImport = true
-    private var mode = "jpg"           // "jpg", "raw" ou "both"
     private var started = false
+    private var sessionOpen = false
+    private var catalogReady = false
+
+    private var autoImport = true
+    private var mode = "jpg"            // "jpg", "raw" ou "both"
+    private var syncMode = "interval"   // "interval" (câmera livre) ou "live" (conexão sempre aberta)
+    private var every: TimeInterval = 15
+    private var timer: Timer?
+
+    private var baseline: Set<String>?  // arquivos que já estavam no cartão quando a câmera foi ligada
     private var received = Set<String>()
     private var queue: [ICCameraFile] = []
     private var busy = false
+    private var pendingImportAll = false
     private var current: String?
+    private var lastSync: Date?
     private var lastError: String?
 
     private lazy var folder: URL = {
@@ -30,11 +43,16 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     func handle(cmd: String, body: [String: Any]) {
         if let m = body["mode"] as? String { mode = m }
         if let a = body["auto"] as? Bool { autoImport = a }
+        if let s = body["sync"] as? String { syncMode = s }
+        if let e = body["every"] as? NSNumber, e.doubleValue >= 5 { every = e.doubleValue }
         switch cmd {
         case "start": start()
         case "importAll": importAll()
+        case "syncNow": openSession()
         default: break
         }
+        schedule()
+        if syncMode == "live" { openSession() } else { maybeClose() }
         pushStatus()
     }
 
@@ -52,11 +70,64 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         }
     }
 
-    private func importAll() {
-        guard let cam = camera else { return }
-        for item in cam.mediaFiles ?? [] {
-            if let file = item as? ICCameraFile, wanted(file.name ?? "") { enqueue(file) }
+    private func schedule() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: every, repeats: true) { [weak self] _ in
+            self?.tick()
         }
+    }
+
+    private func tick() {
+        guard camera != nil, !busy else { return }
+        if !sessionOpen { openSession() }
+    }
+
+    // MARK: conexão com a câmera
+
+    private func openSession() {
+        guard let cam = camera, !sessionOpen else { return }
+        catalogReady = false
+        cam.requestOpenSession()
+        pushStatus()
+        // Algumas câmeras não avisam quando o catálogo fica pronto ao reabrir a conexão.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self = self, self.sessionOpen, !self.catalogReady else { return }
+            self.catalogReady = true
+            self.processCatalog()
+        }
+    }
+
+    private func maybeClose() {
+        guard syncMode == "interval", sessionOpen, catalogReady, !busy, queue.isEmpty, !pendingImportAll else { return }
+        camera?.requestCloseSession()
+        sessionOpen = false
+        catalogReady = false
+        lastSync = Date()
+        pushStatus()
+    }
+
+    private func processCatalog() {
+        guard let cam = camera else { return }
+        let files = (cam.mediaFiles ?? []).compactMap { $0 as? ICCameraFile }
+        if baseline == nil {
+            baseline = Set(files.map { key($0) })
+        } else if autoImport {
+            for f in files where !(baseline?.contains(key(f)) ?? false) && wanted(f.name ?? "") {
+                enqueue(f)
+            }
+        }
+        if pendingImportAll {
+            pendingImportAll = false
+            for f in files where wanted(f.name ?? "") { enqueue(f) }
+        }
+        pushStatus()
+        maybeClose()
+    }
+
+    private func importAll() {
+        guard camera != nil else { return }
+        pendingImportAll = true
+        if sessionOpen && catalogReady { processCatalog() } else { openSession() }
     }
 
     // MARK: escolha dos arquivos
@@ -86,9 +157,10 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
 
     private func next() {
         guard !busy else { return }
-        guard let cam = camera, !queue.isEmpty else {
+        guard let cam = camera, sessionOpen, !queue.isEmpty else {
             current = nil
             pushStatus()
+            maybeClose()
             return
         }
         busy = true
@@ -143,12 +215,16 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         var o: [String: Any] = ["connected": camera != nil,
                                 "searching": started && camera == nil,
                                 "auto": autoImport,
-                                "mode": mode]
+                                "mode": mode,
+                                "sync": syncMode,
+                                "every": Int(every),
+                                "open": sessionOpen]
         if let cam = camera {
             o["name"] = cam.name ?? "Câmera"
-            if catalogReady { o["items"] = cam.mediaFiles?.count ?? 0 }
+            if let b = baseline { o["items"] = max(b.count, cam.mediaFiles?.count ?? 0) }
         }
         if let cur = current { o["downloading"] = cur; o["queue"] = queue.count }
+        if let t = lastSync { o["lastSync"] = Int(Date().timeIntervalSince(t)) }
         if let err = lastError { o["error"] = err }
         guard let d = try? JSONSerialization.data(withJSONObject: o),
               let json = String(data: d, encoding: .utf8) else { return }
@@ -157,10 +233,13 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
 
     private func reset() {
         camera = nil
+        sessionOpen = false
         catalogReady = false
+        baseline = nil
         queue.removeAll()
         busy = false
         current = nil
+        pendingImportAll = false
         pushStatus()
     }
 
@@ -169,10 +248,8 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
         guard camera == nil, let cam = device as? ICCameraDevice else { return }
         camera = cam
-        catalogReady = false
         cam.delegate = self
-        cam.requestOpenSession()
-        pushStatus()
+        openSession()
     }
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
@@ -186,27 +263,33 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     }
 
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
-        if let error = error { lastError = error.localizedDescription }
+        if let error = error {
+            lastError = error.localizedDescription
+            sessionOpen = false
+        } else {
+            sessionOpen = true
+        }
         pushStatus()
     }
 
-    func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {}
+    func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
+        sessionOpen = false
+        catalogReady = false
+        pushStatus()
+    }
 
     // MARK: ICCameraDeviceDelegate
 
     func deviceDidBecomeReady(withCompleteContentCatalog device: ICCameraDevice) {
         catalogReady = true
-        pushStatus()
+        processCatalog()
     }
 
     func cameraDevice(_ camera: ICCameraDevice, didAdd items: [ICCameraItem]) {
-        // Antes do catálogo ficar pronto, os itens são as fotos que já estavam no cartão.
-        // Depois disso, cada item novo é uma foto que você acabou de tirar.
-        guard catalogReady else { return }
-        if autoImport {
-            for item in items {
-                if let file = item as? ICCameraFile, wanted(file.name ?? "") { enqueue(file) }
-            }
+        // Fotos tiradas com a conexão aberta (modo "ao vivo") chegam por aqui.
+        guard catalogReady, baseline != nil, autoImport else { return }
+        for item in items {
+            if let file = item as? ICCameraFile, wanted(file.name ?? "") { enqueue(file) }
         }
         pushStatus()
     }
