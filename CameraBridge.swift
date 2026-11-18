@@ -1,5 +1,6 @@
 import Foundation
 import ImageCaptureCore
+import UIKit
 
 /// Conversa com a câmera ligada no cabo USB‑C usando o ImageCaptureCore da Apple
 /// e entrega cada foto ao FOTO REAL.
@@ -32,6 +33,43 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     private var lastSync: Date?
     private var lastError: String?
 
+    // Modo remoto da Canon (o mesmo que o EOS Utility usa): deixa a câmera livre com o cabo ligado
+    private var canonMode = false
+    private var canonTried = false
+    private var polling = false
+    private var pollTimer: Timer?
+    private var txid: UInt32 = 1
+    private var canonQueue: [(UInt32, String)] = []
+    private var canonDone = Set<UInt32>()
+    private var isCanon: Bool { (camera?.name ?? "").lowercased().contains("canon") }
+
+    // Wi‑Fi por FTP
+    private let ftp = FTPServer()
+    private var ftpQueue: [(URL, String)] = []
+    private var ftpBusy = false
+
+    override init() {
+        super.init()
+        ftp.onFile = { [weak self] url, name in
+            DispatchQueue.main.async { self?.ftpQueue.append((url, name)); self?.ftpNext() }
+        }
+        ftp.onStatus = { [weak self] in self?.pushStatus() }
+    }
+
+    private func ftpNext() {
+        guard !ftpBusy, !ftpQueue.isEmpty else { return }
+        ftpBusy = true
+        let (url, name) = ftpQueue.removeFirst()
+        Task { [weak self] in
+            await self?.send(url, name: name)
+            try? FileManager.default.removeItem(at: url)
+            DispatchQueue.main.async {
+                self?.ftpBusy = false
+                self?.ftpNext()
+            }
+        }
+    }
+
     private lazy var folder: URL = {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("camera", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -49,6 +87,14 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         case "start": start()
         case "importAll": importAll()
         case "syncNow": openSession()
+        case "ftpStart":
+            if let p = body["pass"] as? String { ftp.pass = p }
+            let port = (body["port"] as? NSNumber)?.intValue ?? 2121
+            ftp.start(port: UInt16(max(1024, min(65535, port))))
+            UIApplication.shared.isIdleTimerDisabled = true
+        case "ftpStop":
+            ftp.stop()
+            UIApplication.shared.isIdleTimerDisabled = false
         default: break
         }
         schedule()
@@ -78,7 +124,7 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     }
 
     private func tick() {
-        guard camera != nil, !busy else { return }
+        guard camera != nil, !busy, !canonMode else { return }
         if !sessionOpen { openSession() }
     }
 
@@ -98,6 +144,7 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     }
 
     private func maybeClose() {
+        if isCanon && (canonMode || !canonTried) { return }
         guard syncMode == "interval", sessionOpen, catalogReady, !busy, queue.isEmpty, !pendingImportAll else { return }
         camera?.requestCloseSession()
         sessionOpen = false
@@ -218,7 +265,8 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
                                 "mode": mode,
                                 "sync": syncMode,
                                 "every": Int(every),
-                                "open": sessionOpen]
+                                "open": sessionOpen,
+                                "canon": canonMode]
         if let cam = camera {
             o["name"] = cam.name ?? "Câmera"
             if let b = baseline { o["items"] = max(b.count, cam.mediaFiles?.count ?? 0) }
@@ -226,12 +274,25 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         if let cur = current { o["downloading"] = cur; o["queue"] = queue.count }
         if let t = lastSync { o["lastSync"] = Int(Date().timeIntervalSince(t)) }
         if let err = lastError { o["error"] = err }
+        o["ftpOn"] = ftp.running
+        o["ftpPort"] = Int(ftp.port)
+        o["ftpClients"] = ftp.clients
+        o["ftpCount"] = ftp.count
+        if let ip = FTPServer.localIP() { o["ftpIP"] = ip }
+        if let f = ftp.lastFile { o["ftpLast"] = f }
+        if let e = ftp.lastError { o["ftpErr"] = e }
         guard let d = try? JSONSerialization.data(withJSONObject: o),
               let json = String(data: d, encoding: .utf8) else { return }
         Task { [weak self] in await self?.evaluate?("window.FR_native&&FR_native.status(\(json))") }
     }
 
     private func reset() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        canonMode = false
+        canonTried = false
+        polling = false
+        canonQueue.removeAll()
         camera = nil
         sessionOpen = false
         catalogReady = false
@@ -268,8 +329,122 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
             sessionOpen = false
         } else {
             sessionOpen = true
+            if isCanon && !canonMode { enableCanonRemote() }
         }
         pushStatus()
+    }
+
+    // MARK: modo remoto da Canon (PTP)
+
+    private func rd32(_ b: [UInt8], _ o: Int) -> UInt32 {
+        guard o + 3 < b.count else { return 0 }
+        return UInt32(b[o]) | UInt32(b[o + 1]) << 8 | UInt32(b[o + 2]) << 16 | UInt32(b[o + 3]) << 24
+    }
+
+    private func rd16(_ b: [UInt8], _ o: Int) -> UInt16 {
+        guard o + 1 < b.count else { return 0 }
+        return UInt16(b[o]) | UInt16(b[o + 1]) << 8
+    }
+
+    /// Manda um comando PTP para a câmera e devolve os dados e se deu certo.
+    private func ptp(_ op: UInt16, _ params: [UInt32] = [], _ done: @escaping (Data?, Bool) -> Void) {
+        guard let cam = camera else { done(nil, false); return }
+        var bytes: [UInt8] = []
+        func u32(_ v: UInt32) { bytes += [UInt8(v & 0xff), UInt8((v >> 8) & 0xff), UInt8((v >> 16) & 0xff), UInt8((v >> 24) & 0xff)] }
+        func u16(_ v: UInt16) { bytes += [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)] }
+        u32(UInt32(12 + 4 * params.count)); u16(1); u16(op); u32(txid); params.forEach { u32($0) }
+        txid = txid &+ 1
+        cam.requestSendPTPCommand(Data(bytes), outData: nil) { [weak self] data, response, error in
+            guard let self = self else { return }
+            var payload = data
+            let head = [UInt8](data.prefix(12))
+            if head.count == 12 && self.rd16(head, 4) == 2 && self.rd16(head, 6) == op {
+                payload = data.subdata(in: data.startIndex + 12 ..< data.endIndex)
+            }
+            var ok = error == nil
+            let r = [UInt8](response.prefix(8))
+            if r.count == 8 { ok = ok && self.rd16(r, 6) == 0x2001 }
+            DispatchQueue.main.async { done(payload, ok) }
+        }
+    }
+
+    private func enableCanonRemote() {
+        ptp(0x9114, [1]) { [weak self] _, ok1 in           // SetRemoteMode
+            self?.ptp(0x9115, [1]) { _, ok2 in               // SetEventMode
+                guard let self = self else { return }
+                self.canonTried = true
+                self.canonMode = ok1 || ok2
+                if self.canonMode {
+                    self.pollTimer?.invalidate()
+                    self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.poll() }
+                } else {
+                    self.maybeClose()
+                }
+                self.pushStatus()
+            }
+        }
+    }
+
+    private func poll() {
+        guard canonMode, !polling, !busy, camera != nil else { return }
+        polling = true
+        ptp(0x9116) { [weak self] data, _ in                 // GetEvent
+            guard let self = self else { return }
+            self.polling = false
+            if let d = data { self.parseEvents([UInt8](d)) }
+        }
+    }
+
+    private func parseEvents(_ b: [UInt8]) {
+        var o = 0
+        while o + 8 <= b.count {
+            let size = Int(rd32(b, o)), type = rd32(b, o + 4)
+            if size < 8 || o + size > b.count { break }
+            if type == 0 && size == 8 { break }
+            if type == 0xC181 && size > 0x28 {                // ObjectAddedEx: foto nova
+                let handle = rd32(b, o + 8)
+                var name = ""
+                var k = o + 0x28
+                while k < o + size && b[k] != 0 { name.append(Character(UnicodeScalar(b[k]))); k += 1 }
+                if autoImport && !name.isEmpty && wanted(name) && !canonDone.contains(handle) && !canonQueue.contains(where: { $0.0 == handle }) {
+                    canonQueue.append((handle, name))
+                }
+            }
+            o += size
+        }
+        canonNext()
+    }
+
+    private func canonNext() {
+        guard !busy, !canonQueue.isEmpty else { return }
+        busy = true
+        let (handle, name) = canonQueue.removeFirst()
+        current = name
+        pushStatus()
+        ptp(0x1009, [handle]) { [weak self] data, ok in      // GetObject
+            guard let self = self else { return }
+            self.canonDone.insert(handle)
+            guard ok, let d = data, d.count > 1000 else {
+                self.busy = false
+                self.current = nil
+                self.canonNext()
+                return
+            }
+            let url = self.folder.appendingPathComponent(name)
+            try? d.write(to: url)
+            Task { [weak self] in
+                await self?.send(url, name: name)
+                try? FileManager.default.removeItem(at: url)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.ptp(0x9117, [handle]) { _, _ in }   // TransferComplete
+                    self.busy = false
+                    self.current = nil
+                    self.pushStatus()
+                    self.canonNext()
+                }
+            }
+        }
     }
 
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {

@@ -8,6 +8,7 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
     private var downloadTargets: [ObjectIdentifier: URL] = [:]
     private var pendingShares: [URL] = []
     private var sharing = false
+    private var saves: [String: FileHandle] = [:]
     private let ground = UIColor(red: 14 / 255, green: 14 / 255, blue: 16 / 255, alpha: 1)
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
@@ -61,12 +62,33 @@ final class WebViewController: UIViewController, WKNavigationDelegate, WKUIDeleg
         switch cmd {
         case "reload":
             loadSite()
+        case "saveStart":
+            // Envio em tempo real: grava a foto em Arquivos > No meu iPad > FOTO REAL > <projeto>
+            guard let id = body["id"] as? String, let name = body["name"] as? String else { return }
+            let folder = clean((body["folder"] as? String) ?? "fotos")
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dir = docs.appendingPathComponent("FOTO REAL", isDirectory: true).appendingPathComponent(folder, isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent(clean(name))
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            if let handle = try? FileHandle(forWritingTo: url) { saves[id] = handle }
+        case "saveChunk":
+            guard let id = body["id"] as? String, let text = body["b64"] as? String,
+                  let data = Data(base64Encoded: text), let handle = saves[id] else { return }
+            try? handle.write(contentsOf: data)
+        case "saveEnd":
+            if let id = body["id"] as? String, let handle = saves.removeValue(forKey: id) { try? handle.close() }
         case "setURL":
             if let text = body["url"] as? String { AppConfig.saveSite(text) }
             loadSite()
         default:
             camera.handle(cmd: cmd, body: body)
         }
+    }
+
+    private func clean(_ s: String) -> String {
+        let t = s.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-").replacingOccurrences(of: "..", with: "-")
+        return t.isEmpty ? "foto" : t
     }
 
     // MARK: navegação
