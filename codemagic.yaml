@@ -12,6 +12,7 @@ workflows:
           mkdir -p Sources Support Resources/Assets.xcassets/AppIcon.appiconset
           for f in *.swift; do [ -f "$f" ] && mv "$f" Sources/; done
           if [ -f Info.plist ]; then mv Info.plist Support/; fi
+          if [ -f FotoRealSite.html ]; then mv FotoRealSite.html Resources/; else echo "Aviso: sem FotoRealSite.html, o app vai abrir só pelo site"; fi
           if [ -f icon-1024.png ]; then mv icon-1024.png Resources/Assets.xcassets/AppIcon.appiconset/; fi
           echo '{ "info" : { "author" : "xcode", "version" : 1 } }' > Resources/Assets.xcassets/Contents.json
           if [ -f Resources/Assets.xcassets/AppIcon.appiconset/icon-1024.png ]; then

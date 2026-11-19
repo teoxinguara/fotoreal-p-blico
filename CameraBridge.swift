@@ -11,6 +11,9 @@ import UIKit
 final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDelegate, ICCameraDeviceDownloadDelegate {
     /// Roda um comando JavaScript dentro do app web.
     var evaluate: ((String) async -> Void)?
+    /// Verdadeiro quando o app web está rodando de dentro do aparelho (fotoreal://).
+    /// Aí a foto vai por arquivo, sem virar texto — bem mais rápido e leve.
+    var localScheme = false
 
     private let browser = ICDeviceBrowser()
     private var camera: ICCameraDevice?
@@ -48,6 +51,8 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     private var eventCount = 0
     private var found = 0
     private var gotCount = 0
+    private var addedEvents = 0
+    private var held: [(UInt32, String, Int)] = []
     private var diag = ""
     private var canonDone = Set<UInt32>()
     private var isCanon: Bool { (camera?.name ?? "").lowercased().contains("canon") }
@@ -90,8 +95,14 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
     func handle(cmd: String, body: [String: Any]) {
         if let m = body["mode"] as? String { mode = m }
         if let a = body["auto"] as? Bool { autoImport = a }
+        if autoImport || cmd == "importAll", !held.isEmpty {
+            canonQueue.append(contentsOf: held)
+            found += held.count
+            held.removeAll()
+        }
         if let s = body["sync"] as? String { syncMode = s }
         if let e = body["every"] as? NSNumber, e.doubleValue >= 5 { every = e.doubleValue }
+        defer { canonNext() }
         switch cmd {
         case "start": start()
         case "importAll": importAll()
@@ -247,6 +258,17 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
 
     /// Manda o arquivo ao app web em pedaços (não cabe tudo de uma vez).
     private func send(_ url: URL, name: String) async {
+        if localScheme, let evaluate = evaluate {
+            let id = UUID().uuidString
+            let dest = LocalSite.inbox.appendingPathComponent(id)
+            if (try? FileManager.default.moveItem(at: url, to: dest)) == nil {
+                try? FileManager.default.copyItem(at: url, to: dest)
+            }
+            if FileManager.default.fileExists(atPath: dest.path) {
+                await evaluate("window.FR_native&&FR_native.fileUrl&&FR_native.fileUrl('\(id)',\(jsString(name)))")
+                return
+            }
+        }
         guard let data = try? Data(contentsOf: url), let evaluate = evaluate else { return }
         let id = UUID().uuidString
         let b64 = data.base64EncodedString()
@@ -279,7 +301,9 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
                                 "diag": diag,
                                 "events": eventCount,
                                 "found": found,
-                                "got": gotCount]
+                                "got": gotCount,
+                                "added": addedEvents,
+                                "held": held.count]
         if let cam = camera {
             o["name"] = cam.name ?? "Câmera"
             if let b = baseline { o["items"] = max(b.count, cam.mediaFiles?.count ?? 0) }
@@ -447,7 +471,27 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
             if size < 8 || o + size > b.count { break }
             if type == 0 && size == 8 { break }
             eventCount += 1
-            if [0xC181, 0xC1A7, 0xC186, 0xC1A9, 0xC182, 0xC1A8].contains(type) {
+            if type == 0xC181 || type == 0xC1A7 {
+                // Foto nova: o próprio aviso traz o número, o tamanho e o nome do arquivo.
+                addedEvents += 1
+                let handle = rd32(b, o + 8)
+                let fsize = Int(rd32(b, o + 0x1c))
+                var name = ""
+                var k = o + (type == 0xC1A7 ? 0x2c : 0x28)
+                while k < o + size && b[k] != 0 && b[k] < 128 { name.append(Character(UnicodeScalar(b[k]))); k += 1 }
+                if handle != 0 && !canonDone.contains(handle) && !canonQueue.contains(where: { $0.0 == handle }) {
+                    knownHandles.insert(handle)
+                    if name.isEmpty {
+                        candidates.insert(handle)
+                    } else if wanted(name) {
+                        if autoImport { canonQueue.append((handle, name, fsize)); found += 1 }
+                        else { held.append((handle, name, fsize)) }
+                        diag = "Foto nova: \(name)"
+                    } else {
+                        canonDone.insert(handle)
+                    }
+                }
+            } else if [0xC186, 0xC1A9, 0xC182, 0xC1A8].contains(type) {
                 sawNewObject = true
                 let handle = rd32(b, o + 8)
                 if handle != 0 && !canonDone.contains(handle) && !knownHandles.contains(handle) { candidates.insert(handle) }
@@ -489,9 +533,9 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
                 if c == 0 { break }
                 if let u = UnicodeScalar(c) { name.append(Character(u)) }
             }
-            if format != 0x3001 && !name.isEmpty && self.autoImport && self.wanted(name) {
-                self.canonQueue.append((h, name, size))
-                self.found += 1
+            if format != 0x3001 && !name.isEmpty && self.wanted(name) {
+                if self.autoImport { self.canonQueue.append((h, name, size)); self.found += 1 }
+                else { self.held.append((h, name, size)) }
             } else {
                 self.canonDone.insert(h)
             }
@@ -504,37 +548,58 @@ final class CameraBridge: NSObject, ICDeviceBrowserDelegate, ICCameraDeviceDeleg
         busy = true
         let (handle, name, size) = canonQueue.removeFirst()
         current = name
+        diag = "Baixando \(name)"
         pushStatus()
+        downloadObject(handle: handle, size: size) { [weak self] data in
+            guard let self = self else { return }
+            self.canonDone.insert(handle)
+            guard let d = data, d.count > 1000 else {
+                self.diag = "Falhou ao baixar \(name)"
+                self.busy = false
+                self.current = nil
+                self.pushStatus()
+                self.canonNext()
+                return
+            }
+            let url = self.folder.appendingPathComponent(name)
+            try? d.write(to: url)
+            Task { [weak self] in
+                await self?.send(url, name: name)
+                try? FileManager.default.removeItem(at: url)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.ptp(0x9117, [handle]) { _, _ in }   // TransferComplete
+                    self.gotCount += 1
+                    self.diag = "Recebida: \(name)"
+                    self.busy = false
+                    self.current = nil
+                    self.pushStatus()
+                    self.canonNext()
+                }
+            }
+        }
+    }
+
+    /// Baixa o arquivo em pedaços (GetPartialObject). Se a câmera recusar, tenta inteiro (GetObject).
+    private func downloadObject(handle: UInt32, size: Int, done: @escaping (Data?) -> Void) {
         var buffer = Data()
         let chunk: UInt32 = 2_000_000
         func step() {
-            ptp(0x101B, [handle, UInt32(buffer.count), chunk]) { [weak self] data, ok in   // GetPartialObject
-                guard let self = self else { return }
+            ptp(0x101B, [handle, UInt32(buffer.count), chunk]) { [weak self] data, ok in
+                guard let self = self else { done(nil); return }
                 if ok, let d = data, !d.isEmpty {
                     buffer.append(d)
-                    if size > 0 && buffer.count < size && d.count > 0 { step(); return }
-                }
-                self.canonDone.insert(handle)
-                if buffer.count < 1000 || (size > 0 && buffer.count < size) {
-                    self.diag = "Falhou ao baixar \(name)"
-                    self.busy = false; self.current = nil; self.pushStatus(); self.canonNext()
+                    if size > 0 && buffer.count < size { step(); return }
+                    if size <= 0 && UInt32(d.count) >= chunk { step(); return }
+                    done(buffer)
                     return
                 }
-                let url = self.folder.appendingPathComponent(name)
-                try? buffer.write(to: url)
-                Task { [weak self] in
-                    await self?.send(url, name: name)
-                    try? FileManager.default.removeItem(at: url)
-                    DispatchQueue.main.async {
-                        guard let self = self else { return }
-                        self.ptp(0x9117, [handle]) { _, _ in }   // TransferComplete
-                        self.gotCount += 1
-                        self.diag = "Recebida: \(name)"
-                        self.busy = false
-                        self.current = nil
-                        self.pushStatus()
-                        self.canonNext()
+                if buffer.isEmpty {
+                    self.ptp(0x1009, [handle]) { whole, ok2 in
+                        done(ok2 ? whole : nil)
                     }
+                } else {
+                    done(size > 0 && buffer.count < size ? nil : buffer)
                 }
             }
         }

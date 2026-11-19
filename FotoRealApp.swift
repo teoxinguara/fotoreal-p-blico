@@ -10,6 +10,13 @@ enum AppConfig {
         return URL(string: saved.isEmpty ? defaultSite : saved) ?? URL(string: defaultSite)!
     }
 
+    /// "local" = FOTO REAL de dentro do app (sem internet). "remote" = abre o site.
+    static var useLocal: Bool { (UserDefaults.standard.string(forKey: "mode") ?? "local") != "remote" }
+
+    static func setMode(_ mode: String) {
+        UserDefaults.standard.set(mode == "remote" ? "remote" : "local", forKey: "mode")
+    }
+
     static func saveSite(_ text: String) {
         var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty && !t.lowercased().hasPrefix("http") { t = "https://" + t }
